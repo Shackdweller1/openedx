@@ -27,10 +27,13 @@ class Command(BaseCommand):
         # Recreate upstream links for two courses.
         $ ./manage.py cms recreate_upstream_links --course course-v1:edX+DemoX.1+2014 \
         --course course-v1:edX+DemoX.2+2015
+        # Force recreate upstream links for one or more courses including processed ones.
+        $ ./manage.py cms recreate_upstream_links --course course-v1:edX+DemoX.1+2014 \
+        --course course-v1:edX+DemoX.2+2015 --force
         # Recreate upstream links for all courses.
         $ ./manage.py cms recreate_upstream_links --all
         # Force recreate links for all courses including completely processed ones.
-        $ ./manage.py cms recreate_upstream_links --all
+        $ ./manage.py cms recreate_upstream_links --all --force
     """
 
     def add_arguments(self, parser):
