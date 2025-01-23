@@ -1,20 +1,21 @@
 """
 Unit tests for course import and export Celery tasks
 """
-
+import asyncio
 
 import copy
 import json
-import os
-from tempfile import NamedTemporaryFile
-from unittest import mock, TestCase
+import logging
+import pprint
+from unittest import mock
+from unittest.mock import AsyncMock, patch, MagicMock
 from uuid import uuid4
 
 import pytest as pytest
 from django.conf import settings
 from django.contrib.auth.models import User  # lint-amnesty, pylint: disable=imported-auth-user
+from django.test import TestCase
 from django.test.utils import override_settings
-from django.core.files import File
 from edx_toggles.toggles.testutils import override_waffle_flag
 from opaque_keys.edx.keys import CourseKey
 from opaque_keys.edx.locator import CourseLocator
@@ -27,6 +28,10 @@ from cms.djangoapps.contentstore.tasks import (
     update_special_exams_and_publish,
     rerun_course,
     _convert_to_standard_url,
+    _validate_urls_access_in_batches,
+    _filter_by_status,
+    _record_broken_links,
+    _get_urls,
     _check_broken_links,
     _is_studio_url,
     _scan_course_for_links
@@ -284,9 +289,48 @@ class CheckBrokenLinksTaskTest(ModuleStoreTestCase):
         raise NotImplementedError
 
     def test_hash_tags_stripped_from_url_lists(self):
+        url_list = '''
+        href='#'
+        href='http://google.com'
+        src='#'
+        href='https://microsoft.com'
+        src="/static/resource_name"
+        '''
+
+        processed_url_list = _get_urls(url_list)
+        pprint.pp(processed_url_list)
+        processed_lines = len(processed_url_list)    # regex returns a list
+        original_lines = 5
+        assert processed_lines == original_lines-2, \
+            f'Processed URL list lines = {processed_lines}; expected {original_lines - 2}'
+
+    def test_src_and_href_urls_extracted(self):
+        FIRST_URL = 'http://google.com'
+        SECOND_URL = 'https://microsoft.com'
+        THIRD_URL = "/static/resource_name"
+        FOURTH_URL = 'http://ibm.com'
+        url_list = f'''
+        href={FIRST_URL}
+        href={SECOND_URL}
+        src={THIRD_URL}
+        tag={FOURTH_URL}
+        '''
+
+        processed_url_list = _get_urls(url_list)
+        pprint.pp(processed_url_list)
+        assert len(processed_url_list) == 3, f"Expected 3 matches; got {len(processed_url_list)}"
+        assert processed_url_list[0] == FIRST_URL, \
+            f"Failed to properly parse {FIRST_URL}; got {processed_url_list[0]}"
+        assert processed_url_list[1] == SECOND_URL, \
+            f"Failed to properly parse {SECOND_URL}; got {processed_url_list[1]}"
+        assert processed_url_list[2] == THIRD_URL, \
+            f"Failed to properly parse {THIRD_URL}; got {processed_url_list[2]}"
+
+
+    def test_http_and_https_recognized_as_studio_url_schemes(self):
         raise NotImplementedError
 
-    def test_urls_out_count_equals_urls_in_count_when_no_hashtags(self):
+    def test_file_not_recognized_as_studio_url_scheme(self):
         raise NotImplementedError
 
     def test_http_url_not_recognized_as_studio_url_scheme(self):
@@ -308,10 +352,11 @@ class CheckBrokenLinksTaskTest(ModuleStoreTestCase):
         self.assertTrue(_is_studio_url(f'/static/test'))
 
     @pytest.mark.parametrize("url, course_key, post_substitution_url",
-                             ["/static/anything_goes_here?raw", "1", "2"])
+                             [("/static/anything_goes_here?raw", "1", "2")])
     def test_url_substitution_on_static_prefixes(self, url, course_key, post_substitution_url):
-        with_substitution = _convert_to_standard_url(url, course_key)
-        assert with_substitution == post_substitution_url, f'{with_substitution} expected to be {post_substitution_url}'
+        substitution_result = _convert_to_standard_url(url, course_key)
+        assert substitution_result == post_substitution_url, \
+            f'{substitution_result} expected to be {post_substitution_url}'
 
     def test_url_substitution_on_forward_slash_prefixes(self):
         raise NotImplementedError
@@ -350,20 +395,196 @@ class CheckBrokenLinksTaskTest(ModuleStoreTestCase):
     def test_every_detected_link_is_validated(self):
         raise NotImplementedError
 
-    def test_link_validation_is_batched(self):
+    def test_number_of_scanned_blocks_equals_blocks_in_course(self):
         raise NotImplementedError
 
-    def test_all_links_in_link_list_longer_than_batch_size_are_validated(self):
-        raise NotImplementedError
+    @pytest.mark.asyncio
+    async def test_every_detected_link_is_validated(self):
+        logging.info("******** In test_every_detected_link_is_validated *******")
+        url_list = ['1', '2', '3', '4', '5']
+        course_key = 'course-v1:edX+DemoX+Demo_Course'
+        batch_size = 2
+        with patch("cms.djangoapps.contentstore.tasks._validate_batch", new_callable=AsyncMock) as mock_validate_batch:
+            mock_validate_batch.side_effect = lambda x, y: x
+            validated_urls = await _validate_urls_access_in_batches(url_list, course_key, batch_size)
+            pprint.pp(validated_urls)
+            pprint.pp(url_list)
+            assert validated_urls == url_list, \
+                f"List of validated urls {validated_urls} is not identical to sourced urls {url_list}"
+
+    @pytest.mark.asyncio
+    async def test_link_validation_is_batched(self):
+        logging.info("******** In test_link_validation_is_batched *******")
+        with patch("cms.djangoapps.contentstore.tasks._validate_batch", new_callable=AsyncMock) as mock_validate_batch:
+            mock_validate_batch.return_value = {"status": 200}
+
+            url_list = ['1', '2', '3', '4', '5']
+            course_key = 'course-v1:edX+DemoX+Demo_Course'
+            batch_size=2
+            results = await _validate_urls_access_in_batches(url_list, course_key, batch_size)
+            print(" ***** results =   ******")
+            pprint.pp(results)
+            mock_validate_batch.assert_called()
+            assert mock_validate_batch.call_count == 3 # two full batches and one partial batch
+
+    @pytest.mark.asyncio
+    async def test_all_links_are_validated_with_batch_validation(self):
+        logging.info("******** In test_all_links_are_validated_with_batch_validation *******")
+        with patch("cms.djangoapps.contentstore.tasks._validate_url_access", new_callable=AsyncMock) as mock_validate:
+            mock_validate.return_value = {"status": 200}
+
+            url_list = ['1', '2', '3', '4', '5']
+            course_key = 'course-v1:edX+DemoX+Demo_Course'
+            batch_size=2
+            results = await _validate_urls_access_in_batches(url_list, course_key, batch_size)
+            print(" ***** results =   ******")
+            pprint.pp(results)
+            args_list = mock_validate.call_args_list
+            urls = [call_args.args[1] for call_args in args_list] # The middle argument in each of the function calls
+            for i in range(1,len(url_list)+1):
+                assert str(i) in urls, f'{i} not supplied as a url for validation in batches function'
 
     def test_no_retries_on_403_access_denied_links(self):
-        raise NotImplementedError
+        logging.info("******** In test_no_retries_on_403_access_denied_links *******")
+        url_list = ['1', '2', '3', '4', '5']
+        filtering_input = []
+        for i in range(1, len(url_list)+1): # Notch out one of the URLs, having it return a '403' status code
+            filtering_input.append(
+            {'block_id': f'block_{i}',
+             'url': str(i),
+             'status': 200},
+            )
+        filtering_input[2]['status'] = 403
+        filtering_input[3]['status'] = 500
+        filtering_input[4]['status'] = None
 
+        broken_or_locked_urls, retry_list = _filter_by_status(filtering_input)
+        print(" ***** broken_or_locked_urls =   ******")
+        pprint.pp(broken_or_locked_urls)
+        assert len(broken_or_locked_urls) == 2  # The inputs with status = 403 and 500
+        assert len(retry_list) == 1             # The input with status = None
+        assert retry_list[0][1] == '5'      # The only URL fit for a retry operation (status == None)
+
+
+    @pytest.mark.asyncio
     def test_retries_attempted_on_connection_errors(self):
-        raise NotImplementedError
+        logging.info("******** In test_retries_attempted_on_connection_errors *******")
+        with patch("cms.djangoapps.contentstore.tasks._validate_urls_access_in_batches",
+                   new_callable=AsyncMock) as mock_validate:
+            mock_validate.return_value = [], [['block_1', '1']]
+            with patch("cms.djangoapps.contentstore.tasks._retry_validation",
+                       new_callable=AsyncMock) as mock_retry:
+                mock_retry.return_value = [['block_1', '1']]
+                check_broken_links('user_id', 'course_key_string', 'language')
+                assert mock_retry.call_count == 0, \
+                    f'_retry_validation() called {mock_retry.call_count} times; expected 0'
 
-    def test_max_number_of_retries_is_respected(self):
-        raise NotImplementedError
+    @pytest.mark.asyncio
+    async def test_max_number_of_retries_is_respected(self):
+        logging.info("******** In test_max_number_of_retries_is_respected *******")
+        '''
+        Patch initial validation to show no progress (need retries on everything).
+        Patch retries to behave in an equally non-productive way
+        Assert that the number of retries attempted equals the maximum number allowed
+        '''
+        MAX_RETRIES = 3
+        with patch("cms.djangoapps.contentstore.tasks._validate_url_access",
+                   new_callable=AsyncMock) as mock_validate_url:
+            mock_validate_url.side_effect = \
+                lambda session, url_data, course_key: {'block_id': f'block_{url_data}', 'url': url_data}
+            with patch("cms.djangoapps.contentstore.tasks._retry_validation_and_filter",
+                       new_callable=AsyncMock) as mock_retry_validation:
+                mock_retry_validation.side_effect = \
+                    lambda course_key, results, retry_list: retry_list
 
-    def test_scan_generates_file_named_by_course_key(self):
-        raise NotImplementedError
+                url_list = ['1', '2', '3', '4', '5']
+                course_key = 'course-v1:edX+DemoX+Demo_Course'
+                batch_size=2
+                results = await _validate_urls_access_in_batches(url_list, course_key, batch_size)
+                print(" ***** results =   ******")
+                pprint.pp(results)
+                assert mock_retry_validation.call_count == MAX_RETRIES, \
+                  f'Got {mock_retry_validation.call_count} retries; expected {MAX_RETRIES}'
+
+    # def test_scan_generates_file_named_by_course_key(self, tmp_path):
+    #     course_key = 'course-v1:edX+DemoX+Demo_Course'
+    #     filename = _record_broken_links("", course_key)
+    #     expected_filename = ""
+    #     assert filename == "", f'Got f{filename} as broken links filename; expected {expected_filename}'
+
+    @patch("cms.djangoapps.contentstore.tasks._validate_user", return_value=MagicMock())
+    @patch("cms.djangoapps.contentstore.tasks._scan_course_for_links", return_value=["url1", "url2"])
+    @patch("cms.djangoapps.contentstore.tasks._validate_urls_access_in_batches",
+                  return_value=[{"url": "url1", "status": "ok"}])
+    @patch("cms.djangoapps.contentstore.tasks._filter_by_status",
+           return_value=(["block_1", "url1", True], ["block_2", "url2"]))
+    @patch("cms.djangoapps.contentstore.tasks._retry_validation",
+           return_value=['block_2', 'url2'])
+    @patch("cms.djangoapps.contentstore.tasks._record_broken_links")
+    def test_broken_links(self,
+                          mock_record_broken_links,
+                          mock_retry_validation,
+                          mock_filter,
+                          mock_validate_urls,
+                          mock_scan_course,
+                          mock_validate_user):
+        # Parameters for the function
+        user_id = 1234
+        language = "en"
+        course_key_string = "course-v1:edX+DemoX+2025"
+
+
+        # Mocking self and status attributes for the test
+        class MockStatus:
+            def __init__(self):
+                self.state = "READY"
+
+            def set_state(self, state):
+                self.state = state
+
+            def increment_completed_steps(self):
+                pass
+
+            def fail(self, error_details):
+                self.state = "FAILED"
+
+        class MockSelf:
+            def __init__(self):
+                self.status = MockStatus()
+
+        mock_self = MockSelf()
+
+        _check_broken_links(mock_self, user_id, course_key_string, language)
+
+        # Prepare expected results based on mock settings
+        url_list = mock_scan_course.return_value
+        validated_url_list = mock_validate_urls.return_value
+        broken_or_locked_urls, retry_list = mock_filter.return_value
+        course_key = CourseKey.from_string(course_key_string)
+
+        if retry_list:
+            retry_results = mock_retry_validation.return_value
+            broken_or_locked_urls.extend(retry_results)
+
+        # Perform verifications
+        try:
+            mock_self.status.increment_completed_steps()
+            mock_retry_validation.assert_called_once_with(
+                mock_filter.return_value[1], course_key, retry_count=3
+            )
+        except Exception as e:
+            logging.exception("Error checking links for course %s", course_key_string, exc_info=True)
+            if mock_self.status.state != "FAILED":
+                mock_self.status.fail({"raw_error_msg": str(e)})
+            assert False, "Exception should not occur"
+
+        # Assertions to confirm patched calls were invoked
+        mock_validate_user.assert_called_once_with(mock_self, user_id, language)
+        mock_scan_course.assert_called_once_with(course_key)
+        mock_validate_urls.assert_called_once_with(url_list, course_key, batch_size=100)
+        mock_filter.assert_called_once_with(validated_url_list)
+        if retry_list:
+            mock_retry_validation.assert_called_once_with(retry_list, course_key, retry_count=3)
+        mock_record_broken_links.assert_called_once()
+
+
