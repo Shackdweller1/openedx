@@ -1204,16 +1204,23 @@ async def _validate_urls_access_in_batches(url_list, course_key, batch_size=100)
 
     for i in range(0, url_count, batch_size):
         batch = url_list[i:i + batch_size]
-        async with aiohttp.ClientSession() as session:
-            tasks = [_validate_url_access(session, url_data, course_key) for url_data in batch]
-            batch_results = await asyncio.gather(*tasks)
-            responses.extend(batch_results)
-            LOGGER.debug(f'[Link Check] request batch {i // batch_size + 1} of {url_count // batch_size + 1}')
+        batch_results = await _validate_batch(batch, course_key)
+        responses.extend(batch_results)
+        LOGGER.debug(f'[Link Check] request batch {i // batch_size + 1} of {url_count // batch_size + 1}')
 
     return responses
 
+
+async def _validate_batch(batch, course_key):
+    async with aiohttp.ClientSession() as session:
+        tasks = [_validate_url_access(session, url_data, course_key) for url_data in batch]
+        batch_results = await asyncio.gather(*tasks)
+        return batch_results
+
 def _retry_validation(url_list, course_key, retry_count=3):
-    """Retry urls that failed due to connection error."""
+    """Retry urls that failed due to connection error.
+    returns URLs that could not be validated either because locked, or because of persistent connection problems
+    """
     results = []
     retry_list = url_list
     for i in range(0, retry_count):
@@ -1255,16 +1262,10 @@ def _filter_by_status(results):
 
     return filtered_results, retry_list
 
-def _save_broken_links_file(artifact, file_to_save):
-    artifact.file.save(name=os.path.basename(file_to_save.name), content=File(file_to_save))
-    artifact.save()
-    return True
-
-def _write_broken_links_to_file(broken_or_locked_urls, broken_links_file):
-    with open(broken_links_file.name, 'w') as file:
-        json.dump(broken_or_locked_urls, file, indent=4)
-
 def _check_broken_links(task_instance, user_id, course_key_string, language):
+    """
+    Checks for broken links in a course. Store the results in a file.
+    """
     user = _validate_user(task_instance, user_id, language)
 
     task_instance.status.set_state('Scanning')
@@ -1280,18 +1281,7 @@ def _check_broken_links(task_instance, user_id, course_key_string, language):
 
     try:
         task_instance.status.increment_completed_steps()
-
-        file_name = str(course_key)
-        broken_links_file = NamedTemporaryFile(prefix=file_name + '.', suffix='.json')
-        LOGGER.debug(f'[Link Check] json file being generated at {broken_links_file.name}')
-
-        with open(broken_links_file.name, 'w') as file:
-            json.dump(broken_or_locked_urls, file, indent=4)
-
-        _write_broken_links_to_file(broken_or_locked_urls, broken_links_file)
-
-        artifact = UserTaskArtifact(status=task_instance.status, name='BrokenLinks')
-        _save_broken_links_file(artifact, broken_links_file)
+        _record_broken_links(task_instance, broken_or_locked_urls, course_key)
 
     # catch all exceptions so we can record useful error messages
     except Exception as e:  # pylint: disable=broad-except
@@ -1300,6 +1290,19 @@ def _check_broken_links(task_instance, user_id, course_key_string, language):
             task_instance.status.fail({'raw_error_msg': str(e)})
         return
 
+def _record_broken_links(task, broken_or_locked_urls, course_key):
+    # Save to temp file
+    file_name = str(course_key)
+    broken_links_file = NamedTemporaryFile(prefix=file_name + '.', suffix='.json')
+    LOGGER.debug(f'[Link Check] json file being generated at {broken_links_file.name}')
+    with open(broken_links_file.name, 'w') as file:
+        json.dump(broken_or_locked_urls, file, indent=4)
+
+    # Now upload temp file to permanent storage
+    artifact = UserTaskArtifact(status=task.status, name='BrokenLinks')
+    artifact.file.save(name=os.path.basename(broken_links_file.name), content=File(broken_links_file))
+    artifact.save()
+    return artifact.file.name
 
 @shared_task(base=CourseLinkCheckTask, bind=True)
 def check_broken_links(self, user_id, course_key_string, language):
