@@ -44,7 +44,7 @@ from openedx.core.djangoapps.course_apps.toggles import EXAMS_IDA
 from openedx.core.djangoapps.embargo.models import Country, CountryAccessRule, RestrictedCourse
 from xmodule.modulestore import ModuleStoreEnum
 from xmodule.modulestore.django import modulestore  # lint-amnesty, pylint: disable=wrong-import-order
-from xmodule.modulestore.tests.django_utils import TEST_DATA_SPLIT_MODULESTORE
+from xmodule.modulestore.tests.django_utils import TEST_DATA_SPLIT_MODULESTORE, ModuleStoreTestCase
 from xmodule.modulestore.tests.factories import CourseFactory  # lint-amnesty, pylint: disable=wrong-import-order
 from celery import Task
 
@@ -244,7 +244,6 @@ class CheckBrokenLinksTaskTest(ModuleStoreTestCase):
         ]
 
     @mock.patch('cms.djangoapps.contentstore.tasks.UserTaskArtifact', autospec=True)
-    @mock.patch('cms.djangoapps.contentstore.tasks.UserTaskStatus', autospec=True)
     @mock.patch('cms.djangoapps.contentstore.tasks._scan_course_for_links')
     @mock.patch('cms.djangoapps.contentstore.tasks._save_broken_links_file', autospec=True)
     @mock.patch('cms.djangoapps.contentstore.tasks._write_broken_links_to_file', autospec=True)
@@ -253,7 +252,6 @@ class CheckBrokenLinksTaskTest(ModuleStoreTestCase):
         mock_write_broken_links_to_file,
         mock_save_broken_links_file,
         mock_scan_course_for_links,
-        _mock_user_task_status,
         mock_user_task_artifact
     ):
         '''

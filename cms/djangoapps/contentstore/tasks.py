@@ -1226,15 +1226,20 @@ def _retry_validation(url_list, course_key, retry_count=3):
     for i in range(0, retry_count):
         if retry_list:
             LOGGER.debug(f'[Link Check] retry attempt #{i + 1}')
-            validated_url_list = asyncio.run(
-                _validate_urls_access_in_batches(retry_list, course_key, batch_size=100)
-            )
-            filetered_url_list, retry_list = _filter_by_status(validated_url_list)
-            results.extend(filetered_url_list)
-
+            retry_list = _retry_validation_and_filter(course_key, results, retry_list)
     results.extend(retry_list)
 
     return results
+
+
+def _retry_validation_and_filter(course_key, results, retry_list):
+    validated_url_list = asyncio.run(
+        _validate_urls_access_in_batches(retry_list, course_key, batch_size=100)
+    )
+    filtered_url_list, retry_list = _filter_by_status(validated_url_list)
+    results.extend(filtered_url_list)
+    return retry_list
+
 
 def _filter_by_status(results):
     """
@@ -1262,6 +1267,15 @@ def _filter_by_status(results):
 
     return filtered_results, retry_list
 
+def _save_broken_links_file(artifact, file_to_save):
+    artifact.file.save(name=os.path.basename(file_to_save.name), content=File(file_to_save))
+    artifact.save()
+    return True
+
+def _write_broken_links_to_file(broken_or_locked_urls, broken_links_file):
+    with open(broken_links_file.name, 'w') as file:
+        json.dump(broken_or_locked_urls, file, indent=4)
+
 def _check_broken_links(task_instance, user_id, course_key_string, language):
     """
     Checks for broken links in a course. Store the results in a file.
@@ -1281,7 +1295,18 @@ def _check_broken_links(task_instance, user_id, course_key_string, language):
 
     try:
         task_instance.status.increment_completed_steps()
-        _record_broken_links(task_instance, broken_or_locked_urls, course_key)
+
+        file_name = str(course_key)
+        broken_links_file = NamedTemporaryFile(prefix=file_name + '.', suffix='.json')
+        LOGGER.debug(f'[Link Check] json file being generated at {broken_links_file.name}')
+
+        with open(broken_links_file.name, 'w') as file:
+            json.dump(broken_or_locked_urls, file, indent=4)
+
+        _write_broken_links_to_file(broken_or_locked_urls, broken_links_file)
+
+        artifact = UserTaskArtifact(status=task_instance.status, name='BrokenLinks')
+        _save_broken_links_file(artifact, broken_links_file)
 
     # catch all exceptions so we can record useful error messages
     except Exception as e:  # pylint: disable=broad-except
