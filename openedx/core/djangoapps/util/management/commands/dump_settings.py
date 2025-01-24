@@ -6,12 +6,10 @@ import json
 import re
 import sys
 from datetime import timedelta
-from importlib.resources import files
 from path import Path
 
 from django.conf import settings
-from django.core.management.base import BaseCommand, CommandError
-from django.test import TestCase
+from django.core.management.base import BaseCommand
 
 
 SETTING_NAME_REGEX = re.compile(r'^[A-Z][A-Z0-9_]*$')
@@ -48,14 +46,14 @@ class Command(BaseCommand):
         Handle the command.
         """
         settings_json = {
-            name: _to_json_friendly_repr(getattr(settings, name))
+            name: _to_json_friendly_repr(getattr(settings, name), f"settings.{name}")
             for name in dir(settings)
             if SETTING_NAME_REGEX.match(name)
         }
         print(json.dumps(settings_json, indent=4))
 
 
-def _to_json_friendly_repr(value: object) -> object:
+def _to_json_friendly_repr(value: object, debug_key: str) -> object:
     """
     Turn the value into something that we can print to a JSON file (that is: str, bool, None, int, float, list, dict).
 
@@ -64,18 +62,20 @@ def _to_json_friendly_repr(value: object) -> object:
     if isinstance(value, (type(None), bool, int, float, str)):
         # All these types can be printed directly
         return value
-    if isinstance(value, (list, tuple)):
-        # Print both lists and tuples as JSON arrays
-        return [_to_json_friendly_repr(element) for element in value]
-    if isinstance(value, set):
-        # Print sets by sorting them (so that order doesn't matter) and printing the result as a JSON array
-        return [sorted(_to_json_friendly_repr(element) for element in value)]
+    if isinstance(value, (list, tuple, set)):
+        if isinstance(value, set):
+            # Print sets by sorting them (so that order doesn't matter) into a JSON array.
+            elements = sorted(value)
+        else:
+            # Print both lists and tuples as JSON arrays.
+            elements = value
+        return [_to_json_friendly_repr(element, f"{debug_key}[{ix}]") for ix, element in enumerate(elements)]
     if isinstance(value, dict):
         # Print dicts as JSON objects
         for subkey in value.keys():
             if not isinstance(subkey, (str, int)):
                 raise ValueError(f"Unexpected dict key {subkey} of type {type(subkey)}")
-        return {subkey: _to_json_friendly_repr(subval) for subkey, subval in value.items()}
+        return {subkey: _to_json_friendly_repr(subval, f"{debug_key}[{subkey!r}]") for subkey, subval in value.items()}
     if isinstance(value, Path):
         # Print path objects as the string `Path('path/to/something')`.
         return repr(value)
@@ -87,7 +87,7 @@ def _to_json_friendly_repr(value: object) -> object:
         if len(proxy_args) == 1:
             if isinstance(proxy_args[0], str):
                 return proxy_args[0]
-        raise ValueError(f"Not sure how to dump value {value!r} with proxy args {proxy_args!r}")
+        raise ValueError(f"Not sure how to dump {debug_key} with value {value!r} with proxy args {proxy_args!r}")
     if value is sys.stderr:
         # Print the stderr object as simply "sys.stderr"
         return "sys.stderr"
@@ -97,7 +97,9 @@ def _to_json_friendly_repr(value: object) -> object:
         qualname = value.__qualname__
     except AttributeError:
         # If that doesn't work, then give up--we don't know how to print this value.
-        raise ValueError(f"Not sure how to dump value {value!r} of type {type(value)}")
+        raise ValueError(  # pylint: disable=raise-missing-from
+            f"Not sure how to dump {debug_key} with value {value!r} of type {type(value)}"
+        )
     if qualname == "<lambda>":
         # Handle lambdas by printing the source lines
         return inspect.getsource(value).strip()
