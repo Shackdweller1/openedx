@@ -13,13 +13,14 @@ import math
 from django.core.files.base import ContentFile
 from django.utils.timezone import now
 from edxval.api import create_external_video, create_or_update_video_transcript, delete_video_transcript
-from opaque_keys.edx.locator import CourseLocator
+from opaque_keys.edx.locator import CourseLocator, LibraryLocatorV2
 from webob import Response
 from xblock.core import XBlock
 from xblock.exceptions import JsonHandlerError
 
 from xmodule.exceptions import NotFoundError
 from xmodule.fields import RelativeTime
+from openedx.core.djangoapps.content_libraries import api as lib_api
 
 from .transcripts_utils import (
     Transcript,
@@ -497,6 +498,7 @@ class VideoStudioViewHandlers:
         """
         _ = self.runtime.service(self, "i18n").ugettext
 
+        # pylint: disable=too-many-nested-blocks
         if dispatch.startswith('translation'):
 
             if request.method == 'POST':
@@ -517,8 +519,9 @@ class VideoStudioViewHandlers:
                     try:
                         # Convert SRT transcript into an SJSON format
                         # and upload it to S3.
+                        content = transcript_file.read()
                         sjson_subs = Transcript.convert(
-                            content=transcript_file.read().decode('utf-8'),
+                            content=content.decode('utf-8'),
                             input_format=Transcript.SRT,
                             output_format=Transcript.SJSON
                         ).encode()
@@ -541,6 +544,15 @@ class VideoStudioViewHandlers:
                             self.transcripts.pop(language_code, None)
                         self.transcripts[new_language_code] = f'{edx_video_id}-{new_language_code}.srt'
                         response = Response(json.dumps(payload), status=201)
+
+                        if isinstance(self.scope_ids.usage_id.context_key, LibraryLocatorV2):
+                            # Save transcript as static asset in Learning Core if is a library component
+                            filename = f"static/{self.transcripts[new_language_code]}"
+                            lib_api.add_library_block_static_asset_file(
+                                self.scope_ids.usage_id,
+                                filename,
+                                content,
+                            )
                     except (TranscriptsGenerationException, UnicodeDecodeError):
                         response = Response(
                             json={
@@ -562,22 +574,33 @@ class VideoStudioViewHandlers:
                 if edx_video_id:
                     delete_video_transcript(video_id=edx_video_id, language_code=language)
 
-                if language == 'en':
-                    # remove any transcript file from content store for the video ids
-                    possible_sub_ids = [
-                        self.sub,  # pylint: disable=access-member-before-definition
-                        self.youtube_id_1_0
-                    ] + get_html5_ids(self.html5_sources)
-                    for sub_id in possible_sub_ids:
-                        remove_subs_from_store(sub_id, self, language)
-
-                    # update metadata as `en` can also be present in `transcripts` field
-                    remove_subs_from_store(self.transcripts.pop(language, None), self, language)
-
-                    # also empty `sub` field
-                    self.sub = ''  # pylint: disable=attribute-defined-outside-init
+                if isinstance(self.scope_ids.usage_id.context_key, LibraryLocatorV2):
+                    transcript_file_path = f"static/{self.transcripts.pop(language, None)}"
+                    lib_api.delete_library_block_static_asset_file(self.scope_ids.usage_id, transcript_file_path)
+                    field = self.fields['transcripts']
+                    if self.transcripts:
+                        transcripts_copy = self.transcripts.copy()
+                        field.delete_from(self)
+                        field.write_to(self, transcripts_copy)
+                    else:
+                        field.delete_from(self)
                 else:
-                    remove_subs_from_store(self.transcripts.pop(language, None), self, language)
+                    if language == 'en':
+                        # remove any transcript file from content store for the video ids
+                        possible_sub_ids = [
+                            self.sub,  # pylint: disable=access-member-before-definition
+                            self.youtube_id_1_0
+                        ] + get_html5_ids(self.html5_sources)
+                        for sub_id in possible_sub_ids:
+                            remove_subs_from_store(sub_id, self, language)
+
+                        # update metadata as `en` can also be present in `transcripts` field
+                        remove_subs_from_store(self.transcripts.pop(language, None), self, language)
+
+                        # also empty `sub` field
+                        self.sub = ''  # pylint: disable=attribute-defined-outside-init
+                    else:
+                        remove_subs_from_store(self.transcripts.pop(language, None), self, language)
 
                 return Response(status=200)
 

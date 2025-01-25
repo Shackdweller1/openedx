@@ -508,6 +508,8 @@ def manage_video_subtitles_save(item, user, old_metadata=None, generate_translat
                 )
             except TranscriptException:
                 pass
+            except AttributeError:
+                pass
         if reraised_message:
             item.save_with_metadata(user)
             raise TranscriptException(reraised_message)
@@ -1038,6 +1040,12 @@ def get_transcript_from_contentstore(video, language, output_format, transcripts
         )
 
     return transcript_content, transcript_name, Transcript.mime_types[output_format]
+
+def build_components_import_path(usage_key, file_path):
+    """
+    Build components import path
+    """
+    return f"components/{usage_key.block_type}/{usage_key.block_id}/{file_path}"
 
 
 def get_transcript_from_learning_core(video_block, language, output_format, transcripts_info):
